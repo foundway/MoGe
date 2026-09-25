@@ -17,12 +17,8 @@ import click
 TEMP_DIR = Path(tempfile.gettempdir(), 'moge')
 
 
-@click.command(help='Web demo')
-@click.option('--share', is_flag=True, help='Whether to run the app in shared mode.')
-@click.option('--pretrained', 'pretrained_model_name_or_path', default=None, help='Pretrained model name or path. Optional for v1/v2 and required for v3.')
-@click.option('--version', 'model_version', type=click.Choice(['v1', 'v2', 'v3']), default='v3', show_default=True, help='The version of the model.')
-@click.option('--fp16/--fp32', 'use_fp16', default=True, help='Whether to use fp16 or fp32 inference.')
-def main(share: bool, pretrained_model_name_or_path: Optional[str], model_version: str, use_fp16: bool):
+def create_demo(pretrained_model_name_or_path: Optional[str] = None, model_version: str = 'v3', use_fp16: bool = True):
+    """Build the Gradio Blocks demo (loads the model). Returns the unlaunched `gr.Blocks`."""
     print("Import modules...")
     # Lazy import
     import cv2
@@ -41,8 +37,9 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
     except ImportError:
         HUGGINGFACE_SPACES_INSTALLED = False
 
-    import flex_gemm
-    flex_gemm.config.AUTOTUNE_MODE = 'never'    # Disable flex_gemm auto-tuning to avoid latency for the first inference on GPU. 
+    if torch.cuda.is_available():
+        import flex_gemm
+        flex_gemm.config.AUTOTUNE_MODE = 'never'    # Disable flex_gemm auto-tuning to avoid latency for the first inference on GPU. 
 
     try:
         import utils3d_moge as utils3d
@@ -62,7 +59,10 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
             'v3': 'Ruicheng/moge-3-vitl'
         }
         pretrained_model_name_or_path = default_pretrained_models[model_version]
-    model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).cuda().eval()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cpu':
+        use_fp16 = False
+    model = import_model_class_by_version(model_version).from_pretrained(pretrained_model_name_or_path).to(device).eval()
     thread_pool_executor = ThreadPoolExecutor(max_workers=1)
     TEMP_DIR.mkdir(exist_ok=True)
 
@@ -81,7 +81,7 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
     # Inference on GPU. 
     @(spaces.GPU if HUGGINGFACE_SPACES_INSTALLED else lambda x: x)
     def run_with_gpu(image: np.ndarray, resolution_level: int, apply_mask: bool, refine_steps: int) -> Dict[str, np.ndarray]:
-        image_tensor = torch.tensor(image, dtype=torch.float32, device=torch.device('cuda')).permute(2, 0, 1) / 255
+        image_tensor = torch.tensor(image, dtype=torch.float32, device=device).permute(2, 0, 1) / 255
         infer_kwargs = {
             'apply_mask': apply_mask,
             'resolution_level': resolution_level,
@@ -308,6 +308,19 @@ def main(share: bool, pretrained_model_name_or_path: Optional[str], model_versio
             outputs=[measure_image, measure_points, measure_text]
         )
     
+    return demo
+
+
+@click.command(help='Web demo')
+@click.option('--share', is_flag=True, help='Whether to run the app in shared mode.')
+@click.option('--pretrained', 'pretrained_model_name_or_path', default=None, help='Pretrained model name or path. Optional for v1/v2 and required for v3.')
+@click.option('--version', 'model_version', type=click.Choice(['v1', 'v2', 'v3']), default='v3', show_default=True, help='The version of the model.')
+@click.option('--fp16/--fp32', 'use_fp16', default=True, help='Whether to use fp16 or fp32 inference.')
+def main(share: bool, pretrained_model_name_or_path: Optional[str], model_version: str, use_fp16: bool):
+    from starlette.middleware import Middleware
+    from starlette.middleware.gzip import GZipMiddleware
+
+    demo = create_demo(pretrained_model_name_or_path, model_version, use_fp16)
     demo.launch(
         share=share,
         allowed_paths=[str(TEMP_DIR)],
